@@ -1,0 +1,136 @@
+# Compilation de NyxOS sur ce dépôt PUBLIC (minutes GitHub gratuites et illimitées), à partir du code qui reste
+# dans le dépôt PRIVÉ max-prb/claude-think (lu avec un jeton en lecture seule). Construit tout NyxOS, le TESTE
+# (dépôt sain, bureau dans QEMU, installation chiffrée avec Secure Boot), puis publie le dépôt nyxpkg signé
+# (release « nyxos-repo ») et l'image de la clé USB (release « nyxos-iso ») ici même.
+# Secrets de ce dépôt : NYX_SRC_TOKEN (jeton « fine-grained », Contents en lecture seule sur claude-think),
+# NYX_SIGN_KEY (clé privée du dépôt nyxpkg), NYX_SB_KEY (clé Secure Boot : clé privée + certificat).
+# Toutes les heures : si la branche du code a changé depuis la dernière publication, on construit.
+# Les journaux de compilation de ce dépôt sont publics ; le code et les clés ne le sont pas.
+name: NyxOS — compilation
+on:
+  schedule: [{ cron: '17 * * * *' }]
+  workflow_dispatch:
+concurrency: { group: nyxos-build, cancel-in-progress: false }
+permissions: { contents: write }
+env:
+  SRC_REPO: max-prb/claude-think
+  SRC_BRANCH: claude/eager-babbage-rqptjt
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+      build: ${{ steps.head.outputs.sha != '' && (steps.built.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch') }}
+    steps:
+      - name: Dernier commit du code
+        id: head
+        env: { TOKEN: '${{ secrets.NYX_SRC_TOKEN }}' }
+        run: |
+          [ -n "$TOKEN" ] || { echo "::warning::Secret NYX_SRC_TOKEN absent : rien n'est construit."; exit 0; }
+          sha=$(git ls-remote "https://x-access-token:$TOKEN@github.com/$SRC_REPO.git" "refs/heads/$SRC_BRANCH" | cut -f1)
+          [ -n "$sha" ] || { echo "::error::Branche $SRC_BRANCH introuvable (jeton ?)"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"; echo "Code : $sha"
+      - name: Déjà publié ?
+        id: built
+        if: steps.head.outputs.sha != ''
+        uses: actions/cache/restore@v4
+        with: { path: built, key: 'nyxos-built-${{ steps.head.outputs.sha }}', lookup-only: true }
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      max-parallel: 1
+      fail-fast: true   # une vraie erreur arrête aussi les jobs suivants
+      matrix: { part: [1, 2, 3, 4, 5] }   # jusqu'à 5 × 4 h 50 : une construction complète depuis zéro
+    env:
+      RUN_ID: ${{ github.run_id }}
+      W: src/nyxos/work
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: '${{ env.SRC_REPO }}', ref: '${{ needs.check.outputs.sha }}', token: '${{ secrets.NYX_SRC_TOKEN }}', path: src, persist-credentials: false }
+      - name: Place disque et KVM (tests dans QEMU)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
+          sudo docker image prune -af > /dev/null; df -h /
+      - name: Reprendre work/ (cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            src/nyxos/work
+            !src/nyxos/work/build
+            !src/nyxos/work/repo
+            !src/nyxos/work/keys
+            !src/nyxos/work/out
+          key: nyxos-work-${{ github.run_id }}-${{ matrix.part }}
+          restore-keys: nyxos-work-
+      - name: État
+        id: state
+        run: if grep -qsx "$RUN_ID" "$W/.done"; then echo "done=1" >> "$GITHUB_OUTPUT"; fi
+      - name: Construire
+        if: steps.state.outputs.done != '1'
+        env: { NYX_SIGN_KEY: '${{ secrets.NYX_SIGN_KEY }}', NYX_SB_KEY: '${{ secrets.NYX_SB_KEY }}' }
+        run: |
+          [ -n "$NYX_SIGN_KEY" ] || { echo "::error::Secret NYX_SIGN_KEY absent."; exit 1; }
+          mkdir -p "$W/keys" && chmod 700 "$W/keys"
+          printf '%s\n' "$NYX_SIGN_KEY" > "$W/keys/nyxpkg.key" && chmod 600 "$W/keys/nyxpkg.key"
+          if [ -n "$NYX_SB_KEY" ]; then
+            printf '%s\n' "$NYX_SB_KEY" > "$W/keys/secureboot.pem" && chmod 600 "$W/keys/secureboot.pem"
+          else echo "::warning::Secret NYX_SB_KEY absent : NyxOS ne démarrera pas avec Secure Boot activé."; fi
+          kvm=(); [ -e /dev/kvm ] && kvm=(--device /dev/kvm)
+          docker run --rm "${kvm[@]}" -v "$PWD/src:/w" -e HOST_UID="$(id -u)" -e RUN_ID archlinux:latest /w/nyxos/tools/ci-build.sh 290
+          rm -f "$W/keys/nyxpkg.key" "$W/keys/secureboot.pem"
+      - name: Résultats des tests (captures, journal)
+        if: always() && steps.state.outputs.done != '1' && hashFiles('src/nyxos/work/out/desktop.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.part }}
+          path: |
+            src/nyxos/work/out/desktop.log
+            src/nyxos/work/out/install.log
+            src/nyxos/work/out/*.png
+          retention-days: 7
+      - name: Publier
+        if: steps.state.outputs.done != '1' && hashFiles('src/nyxos/work/.done') != ''
+        env: { GH_TOKEN: '${{ github.token }}', GH_REPO: '${{ github.repository }}' }
+        run: |
+          grep -qx "$RUN_ID" "$W/.done" || exit 0
+          cd "$W/repo"
+          gh release view nyxos-repo > /dev/null 2>&1 ||
+            gh release create nyxos-repo --title "NyxOS — mises à jour" \
+              --notes "Paquets de NyxOS, signés et testés, publiés automatiquement. Installés par Paramètres › Mises à jour."
+          have=$(gh release view nyxos-repo --json assets -q '.assets[].name')
+          # Nouveaux paquets d'abord (nom = nom-version : un paquet déjà publié ne change jamais), l'index signé
+          # en dernier : un PC qui se met à jour ne voit jamais un index dont les paquets manquent.
+          for f in *.nyx; do grep -qxF "$f" <<< "$have" || gh release upload nyxos-repo "$f"; done
+          gh release upload nyxos-repo index index.sig --clobber
+          for a in $have; do [ -e "$a" ] || gh release delete-asset nyxos-repo "$a" -y; done
+          # Image de la clé USB d'installation (testée juste avant), dans sa propre release.
+          iso=../out/nyxos.iso
+          if [ -f "$iso" ] && [ "$(stat -c %s "$iso")" -lt 2147483648 ]; then
+            gh release view nyxos-iso > /dev/null 2>&1 ||
+              gh release create nyxos-iso --title "NyxOS — clé USB d'installation" \
+                --notes "Copier NyxOS.iso sur une clé USB (Fedora Media Writer, Rufus en mode DD, ou dd), puis démarrer le PC dessus."
+            cp "$iso" ../out/NyxOS.iso && (cd ../out && sha256sum NyxOS.iso > NyxOS.iso.sha256)
+            gh release upload nyxos-iso ../out/NyxOS.iso ../out/NyxOS.iso.sha256 --clobber
+          else echo "::warning::nyxos.iso absente ou trop grande pour une release (2 Go) : non publiée."; fi
+          mkdir -p "$GITHUB_WORKSPACE/built" && echo "${{ needs.check.outputs.sha }}" > "$GITHUB_WORKSPACE/built/sha"
+      - name: Marquer ce code comme publié
+        if: hashFiles('built/sha') != ''
+        uses: actions/cache/save@v4
+        with: { path: built, key: 'nyxos-built-${{ needs.check.outputs.sha }}' }
+      - name: Garder work/ (cache)
+        if: always() && steps.state.outputs.done != '1'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            src/nyxos/work
+            !src/nyxos/work/build
+            !src/nyxos/work/repo
+            !src/nyxos/work/keys
+            !src/nyxos/work/out
+          key: nyxos-work-${{ github.run_id }}-${{ matrix.part }}
