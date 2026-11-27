@@ -32,8 +32,14 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"; echo "Code : $sha"
       - name: Clés valides ?
         if: steps.head.outputs.sha != ''
-        env: { NYX_SIGN_KEY: '${{ secrets.NYX_SIGN_KEY }}' }
+        env: { NYX_SIGN_KEY: '${{ secrets.NYX_SIGN_KEY }}', NYX_SB_KEY: '${{ secrets.NYX_SB_KEY }}' }
         run: |
+          if [ -n "$NYX_SB_KEY" ]; then
+            k=$(mktemp); printf '%s\n' "$NYX_SB_KEY" | LC_ALL=C sed -E 's/[^-A-Za-z0-9+\/=]+$//;/-----(BEGIN|END) /{s/^.*(-----(BEGIN|END) )/\1/;b};s/^.*[^A-Za-z0-9+\/=]//;/^$/d' > "$k"
+            if openssl pkey -in "$k" -noout 2>/dev/null && openssl x509 -in "$k" -noout 2>/dev/null; then echo "NYX_SB_KEY valide (clé + certificat)."
+            else echo "::error::NYX_SB_KEY illisible ($(wc -l < "$k") lignes, en-têtes : $(grep -c -- '^-----' "$k"), il en faut 4)"; rm -f "$k"; exit 1; fi
+            rm -f "$k"
+          fi
           [ -n "$NYX_SIGN_KEY" ] || { echo "::error::Secret NYX_SIGN_KEY absent."; exit 1; }
           k=$(mktemp); printf '%s\n' "$NYX_SIGN_KEY" | LC_ALL=C sed -E 's/[^-A-Za-z0-9+\/=]+$//;/-----(BEGIN|END) /{s/^.*(-----(BEGIN|END) )/\1/;b};s/^.*[^A-Za-z0-9+\/=]//;/^$/d' > "$k"
           if openssl pkey -in "$k" -pubout -out pub.pem 2>/dev/null; then
@@ -95,7 +101,7 @@ jobs:
           mkdir -p "$W/keys" && chmod 700 "$W/keys"
           printf '%s\n' "$NYX_SIGN_KEY" | LC_ALL=C sed -E 's/[^-A-Za-z0-9+\/=]+$//;/-----(BEGIN|END) /{s/^.*(-----(BEGIN|END) )/\1/;b};s/^.*[^A-Za-z0-9+\/=]//;/^$/d' > "$W/keys/nyxpkg.key" && chmod 600 "$W/keys/nyxpkg.key"
           if [ -n "$NYX_SB_KEY" ]; then
-            printf '%s\n' "$NYX_SB_KEY" > "$W/keys/secureboot.pem" && chmod 600 "$W/keys/secureboot.pem"
+            printf '%s\n' "$NYX_SB_KEY" | LC_ALL=C sed -E 's/[^-A-Za-z0-9+\/=]+$//;/-----(BEGIN|END) /{s/^.*(-----(BEGIN|END) )/\1/;b};s/^.*[^A-Za-z0-9+\/=]//;/^$/d' > "$W/keys/secureboot.pem" && chmod 600 "$W/keys/secureboot.pem"
           else echo "::warning::Secret NYX_SB_KEY absent : NyxOS ne démarrera pas avec Secure Boot activé."; fi
           kvm=(); [ -e /dev/kvm ] && kvm=(--device /dev/kvm)
           docker run --rm "${kvm[@]}" -v "$PWD/src:/w" -e HOST_UID="$(id -u)" -e RUN_ID archlinux:latest /w/nyxos/tools/ci-build.sh 290
