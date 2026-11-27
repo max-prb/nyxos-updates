@@ -35,7 +35,7 @@ jobs:
         env: { NYX_SIGN_KEY: '${{ secrets.NYX_SIGN_KEY }}' }
         run: |
           [ -n "$NYX_SIGN_KEY" ] || { echo "::error::Secret NYX_SIGN_KEY absent."; exit 1; }
-          k=$(mktemp); printf '%s\n' "$NYX_SIGN_KEY" | LC_ALL=C sed 's/^[^-A-Za-z0-9+\/=]*//;s/[^-A-Za-z0-9+\/=]*$//;/^$/d' > "$k"
+          k=$(mktemp); printf '%s\n' "$NYX_SIGN_KEY" | LC_ALL=C sed -E 's/[^-A-Za-z0-9+\/=]+$//;/-----(BEGIN|END) /{s/^.*(-----(BEGIN|END) )/\1/;b};s/^.*[^A-Za-z0-9+\/=]//;/^$/d' > "$k"
           if openssl pkey -in "$k" -pubout -out pub.pem 2>/dev/null; then
             echo "NYX_SIGN_KEY valide. Clé publique (doit être identique à /etc/nyxpkg/repo.pub de NyxOS) :"; cat pub.pem
           else
@@ -93,7 +93,7 @@ jobs:
         run: |
           [ -n "$NYX_SIGN_KEY" ] || { echo "::error::Secret NYX_SIGN_KEY absent."; exit 1; }
           mkdir -p "$W/keys" && chmod 700 "$W/keys"
-          printf '%s\n' "$NYX_SIGN_KEY" | LC_ALL=C sed 's/^[^-A-Za-z0-9+\/=]*//;s/[^-A-Za-z0-9+\/=]*$//;/^$/d' > "$W/keys/nyxpkg.key" && chmod 600 "$W/keys/nyxpkg.key"
+          printf '%s\n' "$NYX_SIGN_KEY" | LC_ALL=C sed -E 's/[^-A-Za-z0-9+\/=]+$//;/-----(BEGIN|END) /{s/^.*(-----(BEGIN|END) )/\1/;b};s/^.*[^A-Za-z0-9+\/=]//;/^$/d' > "$W/keys/nyxpkg.key" && chmod 600 "$W/keys/nyxpkg.key"
           if [ -n "$NYX_SB_KEY" ]; then
             printf '%s\n' "$NYX_SB_KEY" > "$W/keys/secureboot.pem" && chmod 600 "$W/keys/secureboot.pem"
           else echo "::warning::Secret NYX_SB_KEY absent : NyxOS ne démarrera pas avec Secure Boot activé."; fi
