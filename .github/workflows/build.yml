@@ -126,9 +126,20 @@ jobs:
             gh release create nyxos-repo --title "NyxOS — mises à jour" \
               --notes "Paquets de NyxOS, signés et testés, publiés automatiquement. Installés par Paramètres › Mises à jour."
           have=$(gh release view nyxos-repo --json assets -q '.assets[].name')
-          # Nouveaux paquets d'abord (nom = nom-version : un paquet déjà publié ne change jamais), l'index signé
+          # Paquets d'abord, l'index signé
           # en dernier : un PC qui se met à jour ne voit jamais un index dont les paquets manquent.
-          for f in *.nyx; do grep -qxF "$f" <<< "$have" || gh release upload nyxos-repo "$f"; done
+          # Un fichier publié dont la somme diffère de la liste (même nom, octets différents) est remplacé :
+          # sinon les PC refusent le paquet (« somme SHA-256 invalide »).
+          dig() { gh api "repos/$GH_REPO/releases/tags/nyxos-repo" --jq '.assets[] | "\(.name) \(.digest)"'; }
+          pub=$(dig)
+          for f in *.nyx; do
+            grep -qxF "$f sha256:$(sha256sum "$f" | cut -d' ' -f1)" <<< "$pub" || gh release upload nyxos-repo "$f" --clobber
+          done
+          # La liste n'est publiée que si chaque paquet qu'elle annonce est en ligne, avec la bonne somme.
+          pub=$(dig)
+          while read -r n v sum _; do
+            grep -qxF "$n-$v.nyx sha256:$sum" <<< "$pub" || { echo "::error::$n-$v.nyx : en ligne ≠ liste"; exit 1; }
+          done < index
           gh release upload nyxos-repo index index.sig --clobber
           for a in $have; do [ -e "$a" ] || gh release delete-asset nyxos-repo "$a" -y; done
           # Image de la clé USB d'installation (testée juste avant), dans sa propre release.
